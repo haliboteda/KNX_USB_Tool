@@ -8,7 +8,11 @@
 """
 KNX TP ping-pong test for a Windows KNX/USB HID converter.
 
-Default flow:
+Default menu:
+  1. Continuously send counter bytes from this tool to KNX_TX_GA.
+  2. Enter the original ping-pong flow.
+
+Ping-pong flow:
   OpenPLC writes raw bytes to GA 0/0/1.
   This tool waits for GroupValueWrite telegrams, appends a loop counter byte,
   then writes the reply to GA 0/0/2 and waits again.
@@ -35,6 +39,7 @@ GA_TO_PLC: Final = os.getenv("KNX_TX_GA", "0/0/2")
 MODE: Final = os.getenv("KNX_MODE", "append_counter").strip().lower()
 APPEND_BYTE: Final = int(os.getenv("KNX_APPEND_BYTE", "1"), 0) & 0xFF
 MAX_APPEND_PAYLOAD: Final = int(os.getenv("KNX_MAX_APPEND_PAYLOAD", "14"), 0)
+SEND_INTERVAL_SECONDS: Final = float(os.getenv("KNX_SEND_INTERVAL", "1.0"))
 USB_VID: Final = os.getenv("KNX_USB_VID")
 USB_PID: Final = os.getenv("KNX_USB_PID")
 DEBUG_ALL: Final = os.getenv("KNX_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -55,6 +60,7 @@ GROUP_VALUE_WRITE_MASK = 0x3C0
 GROUP_VALUE_WRITE = 0x080
 
 rx_count = 0
+tx_count = 0
 
 
 @dataclass(frozen=True)
@@ -273,29 +279,59 @@ def find_knx_usb_device() -> dict:
     return candidates[0]
 
 
-def main() -> None:
-    global rx_count
+def select_run_mode() -> str:
+    print("Select run mode:")
+    print("  1. Continuously send data from this tool to KNX bus (default)")
+    print("  2. Ping-pong mode")
 
-    rx_group = parse_group_address(GA_FROM_PLC)
-    tx_group = parse_group_address(GA_TO_PLC)
-    device_info = find_knx_usb_device()
-
-    print("Connecting to KNX/USB HID device...")
-    device = hid.device()
     try:
-        device.open_path(device_info["path"])
-        device.set_nonblocking(1)
-    except OSError as exc:
-        print(f"\nError opening KNX/USB adapter: {exc}", file=sys.stderr)
-        print("Close ETS or any other software holding the USB interface, then retry.", file=sys.stderr)
-        sys.exit(1)
+        choice = input("Enter choice [1]: ").strip()
+    except EOFError:
+        choice = ""
 
+    if choice == "2":
+        return "ping_pong"
+    if choice not in {"", "1"}:
+        print(f"Unknown choice {choice!r}; using mode 1.")
+    return "continuous_send"
+
+
+def print_device_info(device_info: dict) -> None:
     print("Connected.")
     print(
         "  USB device         : "
         f"VID={device_info.get('vendor_id', 0):04X} PID={device_info.get('product_id', 0):04X} "
         f"{device_info.get('manufacturer_string') or ''} {device_info.get('product_string') or ''}"
     )
+
+
+def run_continuous_sender(device: hid.device, tx_group: int) -> None:
+    global tx_count
+
+    print(f"  TX group address   : {GA_TO_PLC}")
+    print(f"  send interval      : {SEND_INTERVAL_SECONDS:g}s")
+    print("\nSending KNX telegrams. Press Ctrl+C to stop.\n")
+
+    try:
+        while True:
+            tx_count += 1
+            payload = (tx_count & 0xFF,)
+            tx_report = build_group_write_report(tx_group, payload)
+            written = device.write(tx_report)
+            print(
+                f"  tx={tx_count:05d}  "
+                f"{GA_TO_PLC} TX [{format_bytes(payload)}] "
+                f"({written} bytes)",
+                flush=True,
+            )
+            time.sleep(SEND_INTERVAL_SECONDS)
+    except KeyboardInterrupt:
+        print(f"\nStopped after {tx_count} telegrams.")
+
+
+def run_ping_pong(device: hid.device, rx_group: int, tx_group: int) -> None:
+    global rx_count
+
     print(f"  RX group address   : {GA_FROM_PLC}")
     print(f"  TX group address   : {GA_TO_PLC}")
     print(f"  mode               : {MODE}")
@@ -354,6 +390,30 @@ def main() -> None:
             time.sleep(0.02)
     except KeyboardInterrupt:
         print(f"\nStopped after {rx_count} exchanges.")
+
+
+def main() -> None:
+    run_mode = select_run_mode()
+    rx_group = parse_group_address(GA_FROM_PLC)
+    tx_group = parse_group_address(GA_TO_PLC)
+    device_info = find_knx_usb_device()
+
+    print("Connecting to KNX/USB HID device...")
+    device = hid.device()
+    try:
+        device.open_path(device_info["path"])
+        device.set_nonblocking(1)
+    except OSError as exc:
+        print(f"\nError opening KNX/USB adapter: {exc}", file=sys.stderr)
+        print("Close ETS or any other software holding the USB interface, then retry.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        print_device_info(device_info)
+        if run_mode == "ping_pong":
+            run_ping_pong(device, rx_group, tx_group)
+        else:
+            run_continuous_sender(device, tx_group)
     finally:
         device.close()
 
